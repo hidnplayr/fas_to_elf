@@ -58,7 +58,6 @@ FAS_SIGNATURE   = 0x1A736166   # little-endian dword at offset 0
 SYM_DEFINED     = 0x0001
 SYM_VARIABLE    = 0x0002
 SYM_MARKER      = 0x0400
-SYM_PUBLIC      = 0x0100   # symbol declared 'public'; absent on 'extrn' references
 
 # val_type (byte at symbol record +11)
 VTYPE_ABSOLUTE  = 0   # compile-time constant / struct offset — no relocation
@@ -122,19 +121,21 @@ DW_LNE_set_address      = 2
 # ---------------------------------------------------------------------------
 @dataclass
 class FasHeader:
-    ver_major:      int
-    ver_minor:      int
-    header_len:     int
-    input_name_off: int   # offset within strings table
-    output_name_off:int
-    strings_off:    int
-    strings_len:    int
-    symbols_off:    int
-    symbols_len:    int
-    source_off:     int
-    source_len:     int
-    dump_off:       int
-    dump_len:       int   # 0 means no assembly dump (error during assembly)
+    ver_major:        int
+    ver_minor:        int
+    header_len:       int
+    input_name_off:   int   # offset within strings table
+    output_name_off:  int
+    strings_off:      int
+    strings_len:      int
+    symbols_off:      int
+    symbols_len:      int
+    source_off:       int
+    source_len:       int
+    dump_off:         int
+    dump_len:         int   # 0 means no assembly dump (error during assembly)
+    sec_names_off:    int   # offset of section names table (ELF/COFF only)
+    sec_names_len:    int   # length; 0 for format binary/PE/MZ
 
 @dataclass
 class FasSymbol:
@@ -144,10 +145,11 @@ class FasSymbol:
     val_type:   int   # 0=absolute (struct offset/const), non-zero=virtual address
     name_ref:   int   # high bit set → strings table (NUL), clear → preproc source (pascal)
     source_line_off: int  # offset of defining line in preprocessed source
+    field20:         int = 0  # raw symbol +20 field (section/external info per spec Table 2)
     # resolved later:
     name:          str  = ''
-    section_index: int  = 0     # which output section this symbol belongs to
-    is_public:     bool = True  # False for 'extrn' references -> emit SHN_UNDEF
+    section_index: int  = 0    # which output section this symbol belongs to (0-based)
+    is_external:   bool = False # True when field20 high bit set -> external ref -> SHN_UNDEF
 
 @dataclass
 class PrepLine:
@@ -184,21 +186,23 @@ class FasParser:
         self.rebase  = rebase
         self.verbose = verbose
         self.hdr:    FasHeader
-        self.symbols:  list[FasSymbol] = []
-        self.dump:     list[DumpRow]   = []
-        self.n_sections: int = 1         # number of distinct output sections detected
+        self.symbols:       list[FasSymbol] = []
+        self.dump:          list[DumpRow]   = []
+        self.n_sections:    int = 1
+        # Section names from the section names table (ELF/COFF only).
+        # section_names[i] = name of FAS section i+1 (table is 1-based).
+        self.section_names: list[str] = []
         # map: prep-source-offset -> PrepLine
         self._prep_lines: dict[int, PrepLine] = {}
-        # map: prep-source-offset -> section_index (built during _parse_dump)
-        self._src_to_section: dict[int, int] = {}
         # cache: filename strings
         self._main_filename = ''
 
     # ------------------------------------------------------------------
     def parse(self):
         self._parse_header()
+        self._parse_section_names()  # ELF/COFF only; empty list for other formats
         self._index_prep_lines()
-        self._parse_dump()      # must precede _parse_symbols (builds _src_to_section)
+        self._parse_dump()
         self._parse_symbols()
 
     # ------------------------------------------------------------------
@@ -214,6 +218,28 @@ class FasParser:
     def _pascal_str(self, off) -> str:
         length = self.data[off]
         return self.data[off+1 : off+1+length].decode('ascii', errors='replace')
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def _parse_section_names(self):
+        """
+        Parse the section names table (header +48/+52).
+        Per spec: exists only for ELF/COFF output.  Each entry is a
+        4-byte offset into the strings table giving the section name.
+        The index in this table matches the section index in the output
+        file (1-based: entry 0 here = section 1 in FASM).
+        """
+        h = self.hdr
+        if h.sec_names_len == 0:
+            return
+        n = h.sec_names_len // 4
+        for i in range(n):
+            name_off = self._u32(h.sec_names_off + i * 4)
+            name = self._null_str(h.strings_off + name_off)
+            self.section_names.append(name)
+        if self.verbose:
+            for i, name in enumerate(self.section_names, 1):
+                print(f'[fas] section[{i}]: {name!r}', file=sys.stderr)
 
     # ------------------------------------------------------------------
     def _parse_header(self):
@@ -243,6 +269,9 @@ class FasParser:
             source_len      = _opt32(36),
             dump_off        = _opt32(40),
             dump_len        = _opt32(44),
+            # Table 1 +48/+52: section names table (ELF/COFF only; 0 otherwise)
+            sec_names_off   = _opt32(48),
+            sec_names_len   = _opt32(52),
         )
         h = self.hdr
         if self.verbose:
@@ -347,16 +376,40 @@ class FasParser:
 
     # ------------------------------------------------------------------
     def _parse_symbols(self):
+        """
+        Parse the symbols table per FAS spec Table 2.
+
+        Field +20 is central to correct symbol classification:
+          vtype != 0 AND high bit of field+20 clear  -> relocatable symbol;
+            bits 0-30 = 1-based section index (same table as section_names).
+          vtype != 0 AND high bit of field+20 set    -> external symbol;
+            bits 0-30 = offset of symbol name in strings table.
+            Emit as SHN_UNDEF.
+          vtype == 0                                 -> absolute value.
+            For format ELF/COFF this is reliably a struct offset / constant.
+            For format binary (no section names table) we apply a span check
+            later in build_symtab to distinguish real labels from constants.
+
+        Names containing '?' are FASM-internal auto-generated identifiers
+        (anonymous struct bases, proc macro internals, import labels) and
+        are excluded — they produce noise in GDB's 'info functions'.
+        """
         h = self.hdr
         if h.symbols_len == 0:
             return
         count = h.symbols_len // 32
+        # Build map: FAS 1-based section index -> our 0-based section index,
+        # using the same mapping established during _parse_dump.
+        # For ELF/COFF we have section_names; for binary we use section_index=0.
+        has_sec_names = len(self.section_names) > 0
+
         for i in range(count):
             base = h.symbols_off + i * 32
             value    = self._u64(base +  0)
             flags    = self._u16(base +  8)
             dsize    = self._u8 (base + 10)
             vtype    = self._u8 (base + 11)
+            field20  = self._u32(base + 20)  # section/external ref per Table 2
             name_ref = self._u32(base + 24)
             src_off  = self._u32(base + 28)
 
@@ -371,35 +424,48 @@ class FasParser:
             if not name:
                 continue
 
-            # Determine which output section this symbol belongs to by
-            # looking up its defining source line in the map built by
-            # _parse_dump().  Falls back to 0 (first section) if not found,
-            # which is correct for symbols declared before any section switch.
-            sec_idx = self._src_to_section.get(src_off, 0)
+            # Filter FASM-internal auto-generated names.  The '?' character
+            # cannot appear in user-defined identifiers in FASM source, so
+            # any name containing it is a compiler-generated internal label
+            # (anonymous struct bases: '..base?B', proc arg slots: '..arg?r',
+            # import entries: '_label?01', etc.).
+            if '?' in name:
+                continue
 
-            # A non-public, non-absolute symbol is an 'extrn' reference:
-            # defined in the FAS table (so we see it) but unresolved externally.
-            # Emit it as SHN_UNDEF so GDB doesn't confuse it with real symbols
-            # at the same address (e.g. writemsg at 0x0 vs msg at 0x0).
-            is_public = bool(flags & SYM_PUBLIC)
+            # Determine section membership and external status from field+20.
+            is_external = False
+            sec_idx     = 0
+            if vtype != VTYPE_ABSOLUTE:
+                if field20 & 0x80000000:
+                    # High bit set: external symbol (extrn / import).
+                    is_external = True
+                elif has_sec_names:
+                    # High bit clear, ELF/COFF: bits 0-30 = 1-based section index.
+                    fas_sec = field20 & 0x7FFFFFFF
+                    # Convert to 0-based.  Section 1 in FAS = index 0 here.
+                    sec_idx = max(0, fas_sec - 1)
+                # else: format binary — sec_idx stays 0 (only one section)
 
             sym = FasSymbol(
                 value           = value + self.rebase,
                 flags           = flags,
                 data_size       = dsize,
                 val_type        = vtype,
+                field20         = field20,
                 name_ref        = name_ref,
                 source_line_off = src_off,
                 name            = name,
                 section_index   = sec_idx,
-                is_public       = is_public,
+                is_external     = is_external,
             )
             self.symbols.append(sym)
             if self.verbose:
-                print(f"[sym] {name:40s}  va={sym.value:#010x}  dsize={dsize}  vtype={vtype}  sec={sec_idx}  public={is_public}", file=sys.stderr)
+                ext_s = ' [external]' if is_external else ''
+                print(f'[sym] {name:40s}  va={sym.value:#010x}'
+                      f'  vtype={vtype}  sec={sec_idx}{ext_s}', file=sys.stderr)
 
         if self.verbose:
-            print(f"[fas] {len(self.symbols)} usable symbols", file=sys.stderr)
+            print(f'[fas] {len(self.symbols)} usable symbols', file=sys.stderr)
 
     # ------------------------------------------------------------------
     def _parse_dump(self):
@@ -409,14 +475,25 @@ class FasParser:
                 print("[fas] no assembly dump (assembly error?)", file=sys.stderr)
             return
 
-        # Detect output-section boundaries by watching the addr field.
-        # FASM maintains an independent virtual counter per output section.
-        # When addr decreases between consecutive rows, the assembler has
-        # switched to a new section and reset its counter.  For a flat binary
-        # there is only one section so addr never decreases and section_index
-        # stays 0 throughout — fully backward-compatible.
+        # Determine section index for each dump row.
+        #
+        # Per spec Table 4 field +20: when the $ address is relocatable,
+        # the high bit is clear and bits 0-30 give the 1-based section index.
+        # We convert to 0-based internally.
+        #
+        # When the section names table is present (ELF/COFF), this gives us
+        # exact section membership directly from the spec-defined field.
+        #
+        # For format binary/PE/MZ the $ address has addr_type=0 (absolute),
+        # so field+20 is zero and carries no section info.  In that case we
+        # fall back to the addr-decrease heuristic: when the virtual counter
+        # resets backwards, FASM has switched to a new output section.
+        use_field20 = len(self.section_names) > 0   # ELF/COFF only
         section_index = 0
         prev_addr     = None
+        # Map from FAS 1-based section index -> our 0-based section index.
+        fas_to_local_sec: dict[int, int] = {}
+        next_local_sec = 0
 
         n_records = (h.dump_len - 4) // 28
         for i in range(n_records):
@@ -425,15 +502,32 @@ class FasParser:
             file_off   = self._u32(base +  0)
             source_off = self._u32(base +  4)
             addr       = self._u64(base +  8)
+            field20    = self._u32(base + 20)
+            addr_type  = self._u8 (base + 24)
             code_type  = self._u8 (base + 25)
             dump_flags = self._u8 (base + 26)
 
             if dump_flags & (DUMP_VIRTUAL | DUMP_NOINFILE):
                 continue
 
-            # Section-boundary detection: addr went backwards.
-            if prev_addr is not None and addr < prev_addr:
-                section_index += 1
+            if use_field20 and addr_type != 0 and not (field20 & 0x80000000):
+                # Spec-defined section index (1-based).  Map to 0-based.
+                fas_sec = field20 & 0x7FFFFFFF
+                if fas_sec == 0:
+                    # fas_sec=0 is invalid (spec is 1-based); this row is a
+                    # preamble directive before any section is established.
+                    # Assign to local section 0 without creating a new entry.
+                    section_index = 0
+                else:
+                    # Valid 1-based index: convert to 0-based local index.
+                    if fas_sec not in fas_to_local_sec:
+                        fas_to_local_sec[fas_sec] = next_local_sec
+                        next_local_sec += 1
+                    section_index = fas_to_local_sec[fas_sec]
+            else:
+                # Fallback: addr-decrease heuristic for format binary/PE.
+                if prev_addr is not None and addr < prev_addr:
+                    section_index += 1
 
             prev_addr = addr
 
@@ -450,15 +544,11 @@ class FasParser:
             )
             self.dump.append(row)
 
-            # Record the mapping source_off -> section_index so that
-            # _parse_symbols() can look up each symbol's home section.
-            self._src_to_section[source_off] = section_index
-
-        self.n_sections = section_index + 1
+        self.n_sections = max((r.section_index for r in self.dump), default=0) + 1
 
         if self.verbose:
-            print(f"[fas] {len(self.dump)} assembly dump rows "
-                  f"across {self.n_sections} section(s)", file=sys.stderr)
+            print(f'[fas] {len(self.dump)} assembly dump rows '
+                  f'across {self.n_sections} section(s)', file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +641,8 @@ class DwarfLineProgram:
         self._prog.append(DW_LNS_copy)
 
     # ------------------------------------------------------------------
-    def build_program(self, rows: list[DumpRow], main_filename: str):
+    def build_program(self, rows: list[DumpRow], main_filename: str,
+                     sec_spans: list[tuple | None] | None = None):
         """
         Walk dump rows and emit DWARF-2 line number opcodes.
 
@@ -582,6 +673,35 @@ class DwarfLineProgram:
             # Sort this section's rows by address.
             sec_rows.sort(key=lambda r: r.addr)
 
+            # Skip preamble rows that lie below the section's real code start.
+            # 'format binary' (org 0x5000) and 'format PE' emit rows at addr=0x0
+            # for format/section/entry directives before the actual code starts.
+            # Those rows force the line table sequence to start at addr=0x0 and
+            # then make a huge advance_pc jump to reach the real code, which
+            # confuses GDB's line lookup.
+            #
+            # Detection: find the largest address gap between consecutive unique
+            # addresses.  If it exceeds 256 bytes, the rows before the gap are
+            # preamble artefacts and should be skipped.
+            # A 256-byte threshold is safe: the largest real instruction is
+            # ~15 bytes, so 256 is far too large to be a normal code gap yet
+            # small enough not to skip anything in a format ELF object where
+            # code genuinely starts at addr 0.
+            unique_addrs = sorted(set(r.addr for r in sec_rows))
+            addr_floor = 0
+            if len(unique_addrs) >= 2:
+                max_gap, gap_start, gap_end = max(
+                    ((unique_addrs[i+1] - unique_addrs[i],
+                      unique_addrs[i], unique_addrs[i+1])
+                     for i in range(len(unique_addrs) - 1)),
+                    key=lambda g: g[0]
+                )
+                if max_gap > 256 and gap_start == unique_addrs[0]:
+                    # The big gap is at the very start: rows before it are preamble.
+                    addr_floor = gap_end
+            if addr_floor > 0:
+                sec_rows = [r for r in sec_rows if r.addr >= addr_floor]
+
             # Per-sequence register state (reset for each section).
             reg_addr      = 0
             prev_file_idx = 1
@@ -590,6 +710,13 @@ class DwarfLineProgram:
 
             for row in sec_rows:
                 if row.line is None:
+                    continue
+
+                # Skip macro-generated lines: their line numbers refer to
+                # positions within the macro body, not the source file.
+                # Including them produces noise (lines 1,2,3 repeating at
+                # many addresses) that obscures real source locations.
+                if row.line.is_macro:
                     continue
 
                 filename = row.line.filename or main_filename
@@ -927,7 +1054,7 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
     binary_format   True when ALL symbols have val_type==0 (format binary).
 
     Symbol classification:
-      is_public=False, val_type!=0     → SHN_UNDEF  (extrn reference)
+      is_external=True               → SHN_UNDEF  (external reference)
       val_type != 0                    → shndx = sec_elf_indices[sym.section_index]
       val_type == 0, binary_format,
         value within sec span          → shndx = section  (format binary label)
@@ -953,11 +1080,9 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
     for sym in symbols:
         name_off = add_str(sym.name)
 
-        if not sym.is_public and sym.val_type != VTYPE_ABSOLUTE:
-            # External reference ('extrn'): non-public, non-absolute.
-            # Must be checked FIRST before the val_type==0 branch so that
-            # extrn symbols in format-binary files (where all val_type==0)
-            # are still correctly emitted as SHN_UNDEF.
+        if sym.is_external:
+            # External reference: field+20 high bit was set (per spec Table 2).
+            # Emit as SHN_UNDEF so GDB doesn't use it for address lookups.
             st_type = STT_NOTYPE
             st_bind = STB_GLOBAL
             st_info = (st_bind << 4) | st_type
@@ -978,12 +1103,14 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
             span = sec_spans[sym.section_index] if sym.section_index < len(sec_spans) else None
             if binary_format and span is not None and span[0] <= val <= span[1]:
                 # Format binary: value within code/data span → real label.
+                # st_size=0: FASM's dsize is unreliable as a code-extent metric
+                # (see flatassembler.net forum discussion on symbol length in ASM).
                 shndx   = sec_elf_indices[sym.section_index]
                 st_type = STT_NOTYPE
                 st_bind = STB_GLOBAL
                 st_info = (st_bind << 4) | st_type
                 entry = struct.pack('<IIIBBH',
-                    name_off, val, sym.data_size, st_info, STV_DEFAULT, shndx,
+                    name_off, val, 0, st_info, STV_DEFAULT, shndx,
                 )
             else:
                 # Format ELF/PE, or binary format with value outside span:
@@ -996,6 +1123,7 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
                 )
         else:
             # Runtime virtual address in a specific output section.
+            # st_size=0: FASM's dsize is unreliable as a code-extent metric.
             shndx   = sec_elf_indices[sym.section_index]
             st_type = STT_NOTYPE
             st_bind = STB_GLOBAL
@@ -1003,7 +1131,7 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
             entry = struct.pack('<IIIBBH',
                 name_off,
                 sym.value & 0xFFFFFFFF,
-                sym.data_size,
+                0,
                 st_info,
                 STV_DEFAULT,
                 shndx,
@@ -1031,20 +1159,8 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     print(f"[*] {len(parser.symbols)} symbols, {len(parser.dump)} dump rows "
           f"across {parser.n_sections} output section(s)")
 
-    # --- Build DWARF line program ---
-    # Rows are passed in dump order (which is file-offset / assembly order).
-    # build_program() groups them by section_index and sorts each group by
-    # address, then emits one DWARF address sequence per section.
-    dwarf = DwarfLineProgram()
-    dwarf.build_program(parser.dump, parser._main_filename)
-    debug_line_bytes = dwarf.serialise()
-    print(f"[*] .debug_line: {len(debug_line_bytes)} bytes, "
-          f"{len(dwarf._files)} source file(s)")
-    if verbose:
-        for i, fn in enumerate(dwarf._files, 1):
-            print(f"    file {i}: {fn}", file=sys.stderr)
-
     # --- Determine per-section address spans ---
+    # (Computed first so build_program can use them to filter preamble rows.)
     # For each detected output section we record [min_addr, max_addr] using
     # only dump rows that belong to it.  These spans drive:
     #   • DW_AT_low_pc / DW_AT_high_pc in .debug_info
@@ -1121,11 +1237,18 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     # sec_elf_indices[section_index] = ELF section index in the output file.
     sec_elf_indices: list[int] = []
 
-    # Standard section names for the first few common sections.
-    SEC_NAMES = [".text", ".data", ".bss", ".rodata"]
+    # Use section names from the FAS section names table when available
+    # (ELF/COFF output).  Fall back to conventional names otherwise.
+    FALLBACK_NAMES = [".text", ".data", ".bss", ".rodata"]
 
     for sec_idx in range(parser.n_sections):
-        name = SEC_NAMES[sec_idx] if sec_idx < len(SEC_NAMES) else f".seg{sec_idx}"
+        # parser.section_names is 0-based: [0] = FAS section 1 = our section 0.
+        if sec_idx < len(parser.section_names):
+            name = parser.section_names[sec_idx]
+        elif sec_idx < len(FALLBACK_NAMES):
+            name = FALLBACK_NAMES[sec_idx]
+        else:
+            name = f".seg{sec_idx}"
 
         # All output sections need SHF_ALLOC so GDB maps them into its
         # address space and can resolve symbols that live in them.
@@ -1156,13 +1279,25 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
         else:
             raw_sec_spans.append(None)
 
-    # Detect format binary: no symbol has val_type != 0.
-    # In that mode FASM bakes all addresses directly and every label is val_type=0.
-    binary_format = not any(
-        s.val_type != VTYPE_ABSOLUTE
-        for s in parser.symbols
-        if not (s.val_type == VTYPE_ABSOLUTE and not s.is_public)
-    )
+    # --- Build DWARF line program ---
+    # Now that raw_sec_spans is available, build_program can filter out
+    # pre-code preamble rows (addr=0 for 'format binary'/'format PE' directives)
+    # that would otherwise force the line table to start at addr=0 and create
+    # a huge advance_pc jump to the real code address, confusing GDB.
+    dwarf = DwarfLineProgram()
+    dwarf.build_program(parser.dump, parser._main_filename, raw_sec_spans)
+    debug_line_bytes = dwarf.serialise()
+    print(f"[*] .debug_line: {len(debug_line_bytes)} bytes, "
+          f"{len(dwarf._files)} source file(s)")
+    if verbose:
+        for i, fn in enumerate(dwarf._files, 1):
+            print(f"    file {i}: {fn}", file=sys.stderr)
+
+    # Format binary: no section names table (binary/PE/MZ) AND all symbols absolute.
+    # In that mode FASM bakes all addresses and marks every label val_type=0,
+    # so we use the section span to distinguish real labels from constants.
+    binary_format = (len(parser.section_names) == 0 and
+                     not any(s.val_type != VTYPE_ABSOLUTE for s in parser.symbols))
     if binary_format:
         print("[*] Format binary detected: using span-check for symbol classification")
 
@@ -1171,16 +1306,19 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     )
     # Recount based on actual classification
     def _is_abs(s):
+        if s.is_external: return False
         if s.val_type != VTYPE_ABSOLUTE: return False
         val  = s.value & 0xFFFFFFFF
         span = raw_sec_spans[s.section_index] if s.section_index < len(raw_sec_spans) else None
         if binary_format and span is not None and span[0] <= val <= span[1]:
-            return False  # classified as real label
+            return False  # format binary real label
         return True
+    ext_count = sum(1 for s in parser.symbols if s.is_external)
     abs_count = sum(1 for s in parser.symbols if _is_abs(s))
-    va_count  = len(parser.symbols) - abs_count
+    va_count  = len(parser.symbols) - abs_count - ext_count
     print(f"[*] .symtab: {len(parser.symbols)} symbols "
-          f"({va_count} virtual-address, {abs_count} absolute/struct-offset)")
+          f"({va_count} virtual-address, {abs_count} absolute/struct-offset,"
+          f" {ext_count} external)")
 
     # .debug_abbrev (must precede .debug_info)
     elf.add_section(".debug_abbrev", SHT_PROGBITS, SHF_NONE, abbrev_bytes)
