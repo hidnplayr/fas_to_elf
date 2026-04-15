@@ -1174,29 +1174,57 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     SHF_EXECINSTR = 0x4
     SHF_WRITE     = 0x1
 
-    # Collect all runtime addresses across all sections for the global median.
-    all_rt_addrs = (
-        [s.value for s in parser.symbols
-         if s.val_type != VTYPE_ABSOLUTE and 0 < s.value <= 0xFFFFFFFF] +
-        [r.addr for r in parser.dump if 0 < r.addr <= 0xFFFFFFFF]
-    )
-    if not all_rt_addrs:
-        raise ValueError(
-            "No valid 32-bit runtime addresses found — "
-            "check your .fas file or use --rebase"
+    # Determine whether this is an object-file format (ELF/COFF) with a section
+    # names table.  In object-file mode ALL addresses are section-relative and
+    # legitimately start at 0x0, so we must NOT filter out addr==0.
+    # For flat binary / PE, addr==0 rows are pre-code preamble directives and
+    # we keep the existing addr>0 guard to exclude them from span computation.
+    object_file_mode = len(parser.section_names) > 0
+
+    # Collect all runtime addresses for the global median (used for windowing).
+    # In object-file mode include addr==0 (valid section start).
+    # In flat/PE mode exclude addr==0 (preamble noise) but also exclude
+    # addresses that have no section association (section_index==0 phantom rows).
+    if object_file_mode:
+        all_rt_addrs = (
+            [s.value & 0xFFFFFFFF for s in parser.symbols
+             if s.val_type != VTYPE_ABSOLUTE and not s.is_external
+             and s.value <= 0xFFFFFFFF] +
+            [r.addr for r in parser.dump
+             if r.section_index > 0 and r.addr <= 0xFFFFFFFF]
         )
-    all_rt_addrs.sort()
-    global_median = all_rt_addrs[len(all_rt_addrs) // 2]
+    else:
+        all_rt_addrs = (
+            [s.value for s in parser.symbols
+             if s.val_type != VTYPE_ABSOLUTE and not s.is_external
+             and 0 < s.value <= 0xFFFFFFFF] +
+            [r.addr for r in parser.dump if 0 < r.addr <= 0xFFFFFFFF]
+        )
+
+    if not all_rt_addrs:
+        # Object-file with all addresses at 0 (e.g. COFF with only data at offset 0).
+        # Use 0 as the median so the window covers everything.
+        global_median = 0
+    else:
+        all_rt_addrs.sort()
+        global_median = all_rt_addrs[len(all_rt_addrs) // 2]
     WINDOW = 0x8000000   # 128 MB either side of the median
 
     # Per-section: gather addresses, apply window filter, compute span.
     # sec_spans[i] = (low_page, high_page) or None if section has no rows.
     sec_spans: list[tuple[int,int] | None] = []
     for sec_idx in range(parser.n_sections):
-        sec_addrs = [r.addr for r in parser.dump
-                     if r.section_index == sec_idx
-                     and 0 < r.addr <= 0xFFFFFFFF
-                     and abs(r.addr - global_median) <= WINDOW]
+        if object_file_mode:
+            # Include addr==0 for object-file sections (section-relative).
+            sec_addrs = [r.addr for r in parser.dump
+                         if r.section_index == sec_idx
+                         and r.addr <= 0xFFFFFFFF
+                         and abs(r.addr - global_median) <= WINDOW]
+        else:
+            sec_addrs = [r.addr for r in parser.dump
+                         if r.section_index == sec_idx
+                         and 0 < r.addr <= 0xFFFFFFFF
+                         and abs(r.addr - global_median) <= WINDOW]
         if not sec_addrs:
             sec_spans.append(None)
         else:
@@ -1207,9 +1235,24 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
 
     comp_dir = os.path.dirname(os.path.abspath(fas_path))
 
-    # Use section-0 span for the CU's low/high_pc (it covers the text).
-    cu_low_pc  = sec_spans[0][0] if sec_spans[0] else 0
-    cu_high_pc = sec_spans[0][1] if sec_spans[0] else 0
+    # Determine the CU's address range for DW_AT_low_pc/high_pc.
+    # Use the first section that has a non-degenerate span.
+    # For COFF/ELF object files where all addresses are section-relative
+    # starting at 0, every span is (0,0).  In that case we use the full
+    # 32-bit address space (0..0xFFFFFFFF) so GDB always finds this CU
+    # when doing line-number lookups after add-symbol-file.
+    cu_low_pc  = 0
+    cu_high_pc = 0
+    for sp in sec_spans:
+        if sp is not None and sp[1] > sp[0]:
+            cu_low_pc  = sp[0]
+            cu_high_pc = sp[1]
+            break
+    if cu_low_pc == cu_high_pc:
+        # Degenerate (all section-relative addresses are 0, as in COFF/ELF object).
+        # Use the full address space so GDB finds this CU for any address.
+        cu_low_pc  = 0
+        cu_high_pc = 0xFFFFFFFF
 
     # --- Build .debug_abbrev + .debug_info ---
     abbrev_bytes, info_bytes = build_debug_info(
@@ -1272,7 +1315,7 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     raw_sec_spans: list[tuple[int,int] | None] = []
     for sec_idx in range(parser.n_sections):
         sec_addrs = [r.addr for r in parser.dump
-                     if r.section_index == sec_idx and 0 <= r.addr <= 0xFFFFFFFF
+                     if r.section_index == sec_idx and r.addr <= 0xFFFFFFFF
                      and abs(r.addr - global_median) <= WINDOW]
         if sec_addrs:
             raw_sec_spans.append((min(sec_addrs), max(sec_addrs)))
