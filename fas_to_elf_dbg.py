@@ -189,6 +189,11 @@ class FasParser:
         self.symbols:       list[FasSymbol] = []
         self.dump:          list[DumpRow]   = []
         self.n_sections:    int = 1
+        # Set of all $ addresses that appear in dump rows (non-virtual, non-noinfile).
+        # Used in binary-format mode to classify vtype=0 labels: a symbol whose
+        # value matches a dump address is a real code/data label; one that doesn't
+        # is a compile-time constant or struct field offset.
+        self.dump_addr_set: set[int] = set()
         # Section names from the section names table (ELF/COFF only).
         # section_names[i] = name of FAS section i+1 (table is 1-based).
         self.section_names: list[str] = []
@@ -543,6 +548,7 @@ class FasParser:
                 line          = pl,
             )
             self.dump.append(row)
+            self.dump_addr_set.add(addr + self.rebase)
 
         self.n_sections = max((r.section_index for r in self.dump), default=0) + 1
 
@@ -659,48 +665,33 @@ class DwarfLineProgram:
 
         self.register_file(main_filename)
 
-        # Only emit line table entries for section 0 (executable code).
-        # Non-text sections (data, bss) share address space starting at 0,
-        # which collides with text addresses in GDB's line lookup.  Real
-        # compilers never put data ranges in .debug_line — breakpoints and
-        # source views only make sense for code.  Symbol shndx assignment
-        # already handles 'print &msg' for data symbols correctly.
-        seen: list[int] = [0]
+        # Which sections to include in the line table.
+        # For ELF/COFF object files all sections start at addr=0; emitting
+        # multiple sequences from addr=0 confuses GDB's line lookup, so we
+        # only emit section 0 (the executable text section).
+        # For format binary the kernel may have multiple code regions with
+        # distinct non-overlapping address ranges (e.g. boot code at
+        # 0x0..0x1ffff and kernel at 0x80000000+). All of them must appear
+        # in the line table so that GDB can resolve source lines anywhere.
+        if sec_spans is not None and all(
+            sp is None or sp == (0, 0)
+            for sp in (sec_spans or [])
+        ):
+            # Object-file mode: all addresses 0-relative, only emit sec 0.
+            seen: list[int] = [0]
+        else:
+            # Emit all sections that have non-macro rows.
+            seen_set: set[int] = set()
+            for r in rows:
+                if r.line and not r.line.is_macro and r.line.line_number > 0:
+                    seen_set.add(r.section_index)
+            seen = sorted(seen_set)
 
         for sec_idx in seen:
             sec_rows = [r for r in rows if r.section_index == sec_idx]
 
             # Sort this section's rows by address.
             sec_rows.sort(key=lambda r: r.addr)
-
-            # Skip preamble rows that lie below the section's real code start.
-            # 'format binary' (org 0x5000) and 'format PE' emit rows at addr=0x0
-            # for format/section/entry directives before the actual code starts.
-            # Those rows force the line table sequence to start at addr=0x0 and
-            # then make a huge advance_pc jump to reach the real code, which
-            # confuses GDB's line lookup.
-            #
-            # Detection: find the largest address gap between consecutive unique
-            # addresses.  If it exceeds 256 bytes, the rows before the gap are
-            # preamble artefacts and should be skipped.
-            # A 256-byte threshold is safe: the largest real instruction is
-            # ~15 bytes, so 256 is far too large to be a normal code gap yet
-            # small enough not to skip anything in a format ELF object where
-            # code genuinely starts at addr 0.
-            unique_addrs = sorted(set(r.addr for r in sec_rows))
-            addr_floor = 0
-            if len(unique_addrs) >= 2:
-                max_gap, gap_start, gap_end = max(
-                    ((unique_addrs[i+1] - unique_addrs[i],
-                      unique_addrs[i], unique_addrs[i+1])
-                     for i in range(len(unique_addrs) - 1)),
-                    key=lambda g: g[0]
-                )
-                if max_gap > 256 and gap_start == unique_addrs[0]:
-                    # The big gap is at the very start: rows before it are preamble.
-                    addr_floor = gap_end
-            if addr_floor > 0:
-                sec_rows = [r for r in sec_rows if r.addr >= addr_floor]
 
             # Per-sequence register state (reset for each section).
             reg_addr      = 0
@@ -767,7 +758,7 @@ class DwarfLineProgram:
         """Emit the complete .debug_line section bytes including the header."""
         file_table = bytearray()
         for fname in self._files:
-            file_table += os.path.basename(fname).encode('utf-8') + b'\x00'
+            file_table += os.path.normpath(fname).encode('utf-8') + b'\x00'
             file_table += b'\x00'  # directory index = 0
             file_table += b'\x00'  # mtime
             file_table += b'\x00'  # size
@@ -1045,7 +1036,8 @@ class ElfBuilder:
 # ---------------------------------------------------------------------------
 def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
                  sec_spans: list[tuple | None],
-                 binary_format: bool = False):
+                 binary_format: bool = False,
+                 dump_addr_set: set | None = None):
     """
     Returns (symtab_bytes, strtab_bytes, n_local).
 
@@ -1097,15 +1089,21 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
         elif sym.val_type == VTYPE_ABSOLUTE:
             # val_type==0: in format ELF/PE this reliably means a compile-time
             # constant or struct field offset → SHN_ABS.
-            # In format binary ALL symbols have val_type=0, so we must
-            # discriminate using the section address span instead.
+            # In format binary ALL symbols have val_type=0, so we use the dump
+            # address set: if any dump row was assembled at this address it is a
+            # real code/data label; otherwise it is a constant or struct offset.
+            # This supersedes the old span-range check which failed for kernels
+            # mixing boot-code (phys 0x0..0x1ffff) with kernel code (0x80000000+):
+            # the 128 MB window excluded the boot region and the per-section span
+            # missed functions whose dump rows landed in a different section.
             val  = sym.value & 0xFFFFFFFF
-            span = sec_spans[sym.section_index] if sym.section_index < len(sec_spans) else None
-            if binary_format and span is not None and span[0] <= val <= span[1]:
-                # Format binary: value within code/data span → real label.
-                # st_size=0: FASM's dsize is unreliable as a code-extent metric
-                # (see flatassembler.net forum discussion on symbol length in ASM).
-                shndx   = sec_elf_indices[sym.section_index]
+            is_real = (binary_format
+                       and dump_addr_set is not None
+                       and val in dump_addr_set)
+            if is_real:
+                # Real code/data label.
+                shndx   = sec_elf_indices[min(sym.section_index,
+                                              len(sec_elf_indices) - 1)]
                 st_type = STT_NOTYPE
                 st_bind = STB_GLOBAL
                 st_info = (st_bind << 4) | st_type
@@ -1113,8 +1111,7 @@ def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
                     name_off, val, 0, st_info, STV_DEFAULT, shndx,
                 )
             else:
-                # Format ELF/PE, or binary format with value outside span:
-                # compile-time constant or struct field offset → SHN_ABS.
+                # Compile-time constant or struct field offset → SHN_ABS.
                 st_type = STT_OBJECT
                 st_bind = STB_GLOBAL
                 st_info = (st_bind << 4) | st_type
@@ -1235,22 +1232,22 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
 
     comp_dir = os.path.dirname(os.path.abspath(fas_path))
 
-    # Determine the CU's address range for DW_AT_low_pc/high_pc.
-    # Use the first section that has a non-degenerate span.
-    # For COFF/ELF object files where all addresses are section-relative
-    # starting at 0, every span is (0,0).  In that case we use the full
-    # 32-bit address space (0..0xFFFFFFFF) so GDB always finds this CU
-    # when doing line-number lookups after add-symbol-file.
-    cu_low_pc  = 0
-    cu_high_pc = 0
-    for sp in sec_spans:
-        if sp is not None and sp[1] > sp[0]:
-            cu_low_pc  = sp[0]
-            cu_high_pc = sp[1]
-            break
-    if cu_low_pc == cu_high_pc:
-        # Degenerate (all section-relative addresses are 0, as in COFF/ELF object).
-        # Use the full address space so GDB finds this CU for any address.
+    # Determine the CU's DW_AT_low_pc/high_pc range.
+    # Must span every address that has a line table entry — GDB uses this
+    # to decide which CU owns a given address when resolving source locations.
+    # We use the exact same row predicate as build_program (non-virtual,
+    # non-noinfile, non-macro, real line number), so the CU range is always
+    # consistent with what the line table actually contains.
+    _line_addrs = [
+        r.addr & 0xFFFFFFFF
+        for r in parser.dump
+        if r.line and not r.line.is_macro and r.line.line_number > 0
+    ]
+    if _line_addrs and max(_line_addrs) > 0:
+        cu_low_pc  = min(_line_addrs)
+        cu_high_pc = (max(_line_addrs) + 0xFFF) & ~0xFFF
+    else:
+        # All addresses are 0 (COFF/ELF object files): cover everything.
         cu_low_pc  = 0
         cu_high_pc = 0xFFFFFFFF
 
@@ -1345,16 +1342,16 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
         print("[*] Format binary detected: using span-check for symbol classification")
 
     symtab_bytes, strtab_bytes, n_local = build_symtab(
-        parser.symbols, sec_elf_indices, raw_sec_spans, binary_format
+        parser.symbols, sec_elf_indices, raw_sec_spans, binary_format,
+        dump_addr_set = parser.dump_addr_set if binary_format else None,
     )
     # Recount based on actual classification
     def _is_abs(s):
         if s.is_external: return False
         if s.val_type != VTYPE_ABSOLUTE: return False
-        val  = s.value & 0xFFFFFFFF
-        span = raw_sec_spans[s.section_index] if s.section_index < len(raw_sec_spans) else None
-        if binary_format and span is not None and span[0] <= val <= span[1]:
-            return False  # format binary real label
+        val = s.value & 0xFFFFFFFF
+        if binary_format and val in parser.dump_addr_set:
+            return False  # real label (found in dump)
         return True
     ext_count = sum(1 for s in parser.symbols if s.is_external)
     abs_count = sum(1 for s in parser.symbols if _is_abs(s))
