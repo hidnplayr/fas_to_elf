@@ -27,19 +27,6 @@ Usage:
     -o        : output path (default: <input>_dbg.elf)
     -v        : verbose: print every symbol and line entry to stderr
 
-Changes vs original:
-  [FIX 1] Added .debug_abbrev + .debug_info with a DW_TAG_compile_unit DIE.
-          Without .debug_info GDB prints "No debugging symbols found" and
-          source-level commands (b file:line, layout src) do not work at all,
-          even when .debug_line is present.
-  [FIX 2] Symbol shndx now uses val_type from the FAS record:
-          val_type == 0  →  SHN_ABS  (absolute constant / struct offset)
-          val_type != 0  →  shndx = .text  (runtime virtual address)
-          Previously every symbol was forced into .text, which caused the
-          534 struct-offset labels (TSS._back, MUTEX.wait_list, …) to appear
-          as functions at address 0x00000000 in "info functions".
-  [FIX 3] Absolute symbols use STT_OBJECT; code labels use STT_NOTYPE so that
-          GDB does not misclassify every address-0 offset as a function.
 """
 
 import argparse
@@ -392,8 +379,8 @@ class FasParser:
             Emit as SHN_UNDEF.
           vtype == 0                                 -> absolute value.
             For format ELF/COFF this is reliably a struct offset / constant.
-            For format binary (no section names table) we apply a span check
-            later in build_symtab to distinguish real labels from constants.
+            For format binary (no section names table) we use the dump address
+            set in build_symtab to distinguish real labels from constants.
 
         Names containing '?' are FASM-internal auto-generated identifiers
         (anonymous struct bases, proc macro internals, import labels) and
@@ -1035,29 +1022,21 @@ class ElfBuilder:
 # Symbol table builder
 # ---------------------------------------------------------------------------
 def build_symtab(symbols: list[FasSymbol], sec_elf_indices: list[int],
-                 sec_spans: list[tuple | None],
                  binary_format: bool = False,
                  dump_addr_set: set | None = None):
     """
     Returns (symtab_bytes, strtab_bytes, n_local).
 
     sec_elf_indices maps section_index → ELF section index in the output file.
-    sec_spans       maps section_index → (lo_addr, hi_addr) or None.
     binary_format   True when ALL symbols have val_type==0 (format binary).
 
     Symbol classification:
       is_external=True               → SHN_UNDEF  (external reference)
       val_type != 0                    → shndx = sec_elf_indices[sym.section_index]
       val_type == 0, binary_format,
-        value within sec span          → shndx = section  (format binary label)
+        addr in dump_addr_set          → shndx = section  (real binary label)
       val_type == 0 otherwise          → SHN_ABS (struct offset / pure constant)
 
-    binary_format is set when no symbol in the file has val_type!=0, which
-    happens with 'format binary'.  In that mode FASM bakes all addresses
-    directly into the output and marks every label val_type=0 — the span
-    check then discriminates real labels from compile-time constants.
-    When val_type!=0 symbols exist (format ELF / PE), val_type is reliable
-    and the span check is not applied.
     """
     strtab = bytearray(b'\x00')
 
@@ -1157,16 +1136,9 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
           f"across {parser.n_sections} output section(s)")
 
     # --- Determine per-section address spans ---
-    # (Computed first so build_program can use them to filter preamble rows.)
-    # For each detected output section we record [min_addr, max_addr] using
-    # only dump rows that belong to it.  These spans drive:
-    #   • DW_AT_low_pc / DW_AT_high_pc in .debug_info
-    #   • The ELF section sh_addr (always 0) and the PT_LOAD anchor
-    # For a flat binary there is one section; for format ELF there may be several.
-    #
-    # Address-span computation uses the same median-windowing heuristic as
-    # before to filter out stray small values (struct offsets that leaked
-    # through as vtype!=0).  We apply it globally then per section.
+    # Used for section display and the ELF PT_LOAD segments.
+    # For object-file formats all addresses are 0-relative so no windowing.
+    # For flat binary / PE a median-window filters stray small addresses.
     SHF_ALLOC     = 0x2
     SHF_EXECINSTR = 0x4
     SHF_WRITE     = 0x1
@@ -1320,10 +1292,6 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
             raw_sec_spans.append(None)
 
     # --- Build DWARF line program ---
-    # Now that raw_sec_spans is available, build_program can filter out
-    # pre-code preamble rows (addr=0 for 'format binary'/'format PE' directives)
-    # that would otherwise force the line table to start at addr=0 and create
-    # a huge advance_pc jump to the real code address, confusing GDB.
     dwarf = DwarfLineProgram()
     dwarf.build_program(parser.dump, parser._main_filename, raw_sec_spans)
     debug_line_bytes = dwarf.serialise()
@@ -1339,10 +1307,10 @@ def convert(fas_path: str, elf_path: str, rebase: int, verbose: bool):
     binary_format = (len(parser.section_names) == 0 and
                      not any(s.val_type != VTYPE_ABSOLUTE for s in parser.symbols))
     if binary_format:
-        print("[*] Format binary detected: using span-check for symbol classification")
+        print("[*] Format binary detected: using dump-address lookup for label classification")
 
     symtab_bytes, strtab_bytes, n_local = build_symtab(
-        parser.symbols, sec_elf_indices, raw_sec_spans, binary_format,
+        parser.symbols, sec_elf_indices, binary_format,
         dump_addr_set = parser.dump_addr_set if binary_format else None,
     )
     # Recount based on actual classification
